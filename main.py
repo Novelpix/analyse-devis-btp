@@ -1,12 +1,17 @@
-# main.py — API "prod lite" : extrait SIRET/SIREN + interroge Annuaire des Entreprises
+# main.py — API "prod lite+" : SIRET/SIREN + Annuaire des Entreprises + Pappers (option) + Google (option) + RGE ADEME (option)
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 import os, httpx, re, io, datetime as dt
 
-APP_NAME = "Analyse Devis API – prod lite"
+APP_NAME = "Analyse Devis API – prod lite+"
 ANN_API = "https://recherche-entreprises.api.gouv.fr/search"
 API_TIMEOUT = float(os.getenv("API_TIMEOUT", "8"))
+
+# ⬇️ RGE via Data-Fair (mettre la variable d'env RGE_QUERY_URL sur Render)
+# Exemple de valeur :
+# https://data.ademe.fr/data-fair/api/v1/datasets/liste-des-entreprises-rge-2/lines?format=json&q_mode=simple&size=50&qs=siret:%SIRET%
+RGE_QUERY_URL = os.getenv("RGE_QUERY_URL", "").strip()
 
 app = FastAPI(title=APP_NAME)
 
@@ -69,7 +74,7 @@ async def search_annuaire(query: str) -> Optional[Dict[str, Any]]:
         return None
 
 def map_annuaire(hit: Dict[str, Any]) -> Dict[str, Any]:
-    """Corrigé : lit 'siege' OU 'etablissement_siege' et reconstruit l’adresse."""
+    """Lit 'siege' OU 'etablissement_siege' et reconstruit l’adresse."""
     if not hit:
         return {}
     siege = hit.get("siege") or hit.get("etablissement_siege") or {}
@@ -130,7 +135,7 @@ async def fetch_google_reviews(name: Optional[str], address: Optional[str]) -> O
             q = f"{name} {address}" if address else name
             r1 = await client.get(
                 "https://maps.googleapis.com/maps/api/place/textsearch/json",
-                params={"query": q, "key": key},
+                params={"query": q, "key": key, "language": "fr", "region": "fr"},
             )
             r1.raise_for_status()
             res = (r1.json() or {}).get("results") or []
@@ -141,7 +146,7 @@ async def fetch_google_reviews(name: Optional[str], address: Optional[str]) -> O
                 return None
             r2 = await client.get(
                 "https://maps.googleapis.com/maps/api/place/details/json",
-                params={"place_id": pid, "key": key, "fields": "rating,user_ratings_total"},
+                params={"place_id": pid, "key": key, "fields": "rating,user_ratings_total", "language": "fr"},
             )
             r2.raise_for_status()
             d = (r2.json() or {}).get("result") or {}
@@ -149,7 +154,48 @@ async def fetch_google_reviews(name: Optional[str], address: Optional[str]) -> O
     except Exception:
         return None
 
+# ---------------- RGE (ADEME Data-Fair) – optionnel ----------------
+def _pick(d: dict, names):
+    for n in names:
+        if n in d and d[n]:
+            return str(d[n]).strip()
+    return None
+
+async def fetch_rge_by_siret(siret: Optional[str]) -> Optional[list]:
+    """Interroge le dataset ADEME via Data-Fair par SIRET si RGE_QUERY_URL est défini."""
+    if not siret or not RGE_QUERY_URL:
+        return None
+    url = RGE_QUERY_URL.replace("%SIRET%", siret)
+    try:
+        async with httpx.AsyncClient(timeout=API_TIMEOUT) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json() or {}
+        rows = data.get("results") or data.get("data") or []
+        out = []
+        for row in rows:
+            rec = row.get("fields", row)  # Data-Fair met souvent sous "fields"
+            item = {
+                "domaine":  _pick(rec, ["domaine_travaux", "domaine", "libelle_domaine", "qualification"]),
+                "organisme":_pick(rec, ["organisme", "certificateur", "organisme_certification"]),
+                "debut":    _pick(rec, ["date_debut", "date_debut_validite", "date_obtention"]),
+                "fin":      _pick(rec, ["date_fin", "date_fin_validite", "date_validite"]),
+            }
+            if any(item.values()):
+                out.append(item)
+        return out or None
+    except Exception:
+        return None
+
 # ---------------- Endpoints ----------------
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": APP_NAME,
+        "endpoints": ["/health", "/api/verify"],
+    }
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": dt.datetime.utcnow().isoformat()}
@@ -183,17 +229,22 @@ async def verify(files: List[UploadFile] = File(...)):
             fin = await fetch_pappers_finance(mapped.get("siren") or ids.get("siren")) or {}
             g = await fetch_google_reviews(mapped.get("raisonSociale"), mapped.get("adresse")) or {}
 
+            # RGE (si RGE_QUERY_URL présent)
+            siret_final = ids.get("siret") or mapped.get("siret")
+            rge_items = await fetch_rge_by_siret(siret_final)
+
             out = {
                 "file": f.filename,
                 "raisonSociale": mapped.get("raisonSociale"),
-                "siret": ids.get("siret") or mapped.get("siret"),
+                "siret": siret_final,
                 "siren": ids.get("siren") or mapped.get("siren"),
                 "naf": mapped.get("naf"),
                 "adresse": mapped.get("adresse"),
                 "statut": mapped.get("statut"),
                 "dateCreation": mapped.get("dateCreation"),
                 "categorie": mapped.get("categorie"),
-                "rge": None,
+                "rge": bool(rge_items),
+                "rge_details": rge_items,
                 "qualibat": None,
                 "qualifelec": None,
                 "qualitenr": None,
@@ -202,8 +253,8 @@ async def verify(files: List[UploadFile] = File(...)):
                 "exercice": fin.get("exercice"),
                 "note": g.get("note"),
                 "nbAvis": g.get("nbAvis"),
-                "scores": {"identification_pct": 100 if (ids.get("siret") or ids.get("siren")) else 0},
-                "drapeaux_rouges": [] if (ids.get("siret") or ids.get("siren")) else ["SIRET/SIREN introuvable"],
+                "scores": {"identification_pct": 100 if (siret_final or (ids.get("siren") or mapped.get("siren"))) else 0},
+                "drapeaux_rouges": [] if (siret_final or (ids.get("siren") or mapped.get("siren"))) else ["SIRET/SIREN introuvable"],
             }
             results.append(out)
         except Exception as e:
