@@ -1,21 +1,21 @@
-# main.py — API "prod lite+" : SIRET/SIREN + Annuaire des Entreprises + Pappers (option) + Google (option) + RGE ADEME (option)
+# main.py — API "prod lite+" : SIRET/SIREN + Annuaire + Pappers (opt) + Google (opt) + RGE ADEME (opt) + Score pondéré
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
-import os, httpx, re, io, datetime as dt
+import os, httpx, re, io, datetime as dt, difflib
 
 APP_NAME = "Analyse Devis API – prod lite+"
 ANN_API = "https://recherche-entreprises.api.gouv.fr/search"
 API_TIMEOUT = float(os.getenv("API_TIMEOUT", "8"))
 
 # ⬇️ RGE via Data-Fair (mettre la variable d'env RGE_QUERY_URL sur Render)
-# Exemple de valeur :
+# Exemple :
 # https://data.ademe.fr/data-fair/api/v1/datasets/liste-des-entreprises-rge-2/lines?format=json&q_mode=simple&size=50&qs=siret:%SIRET%
 RGE_QUERY_URL = os.getenv("RGE_QUERY_URL", "").strip()
 
 app = FastAPI(title=APP_NAME)
 
-# CORS ouvert pour démarrer (tu pourras restreindre à ton domaine GHL plus tard)
+# CORS (ouvert pour démarrer ; restreindre aux domaines GHL ensuite)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # ex.: ["https://*.gohighlevel.com","https://*.gohighlevel.app"]
@@ -27,6 +27,8 @@ app.add_middleware(
 SIRET_RE = re.compile(r"\b(?:\d[\s\.-]?){14}\b")
 SIREN_RE = re.compile(r"\b(?:\d[\s\.-]?){9}\b")
 DIGITS = re.compile(r"\D")
+CP_RE = re.compile(r"\b\d{5}\b")
+LEGAL_SUFFIX = {"sarl","sas","sasu","eurl","sa","sci","snc","scea","ei","eirl","sarl.","sas.","sasu.","sa."}
 
 def _digits(s: str) -> str:
     return DIGITS.sub("", s)
@@ -61,6 +63,28 @@ async def read_text(file: UploadFile) -> str:
 
     # Images (JPG/PNG) : OCR non activé ici
     return ""
+
+# ---------------- Scoring helpers ----------------
+def _norm(s: Optional[str]) -> str:
+    if not s: return ""
+    s = re.sub(r"[^\w\s]", " ", s, flags=re.UNICODE).lower()
+    toks = [t for t in s.split() if t and t not in LEGAL_SUFFIX]
+    return " ".join(toks)
+
+def _sim_name(a: Optional[str], b: Optional[str]) -> float:
+    a1, b1 = _norm(a), _norm(b)
+    if not a1 or not b1: return 0.0
+    return difflib.SequenceMatcher(None, a1, b1).ratio()  # 0..1
+
+def _postal(text: Optional[str]) -> Optional[str]:
+    if not text: return None
+    m = CP_RE.search(text)
+    return m.group(0) if m else None
+
+def _naf_is_construction(naf: Optional[str]) -> bool:
+    if not naf: return False
+    naf = str(naf)
+    return naf.startswith(("41","42","43"))  # Construction
 
 # ---------------- Annuaire des Entreprises ----------------
 async def search_annuaire(query: str) -> Optional[Dict[str, Any]]:
@@ -204,7 +228,7 @@ def health():
 async def verify(files: List[UploadFile] = File(...)):
     """
     Reçoit 1..n fichiers sous la clé 'files' (pluriel).
-    Retourne une synthèse par fichier : identité + NAF + adresse (+ options).
+    Retourne une synthèse par fichier : identité + NAF + adresse (+ options) + score pondéré.
     """
     results = []
     for f in files:
@@ -233,6 +257,29 @@ async def verify(files: List[UploadFile] = File(...)):
             siret_final = ids.get("siret") or mapped.get("siret")
             rge_items = await fetch_rge_by_siret(siret_final)
 
+            # ---- Score d'identification pondéré (0..100)
+            pts = 0
+            siret_match = bool(siret_final and mapped.get("raisonSociale"))
+            if siret_match:
+                pts += 60  # SIRET trouvé + match Annuaire
+
+            first_line = next((ln.strip() for ln in (text or "").splitlines() if ln.strip()), "")
+            sim = _sim_name(first_line, mapped.get("raisonSociale"))
+            name_similarity_pct = int(round(sim * 100))
+            pts += int(round(sim * 15))  # similarité nom (≤15)
+
+            cp_text = _postal(text)
+            cp_addr = _postal(mapped.get("adresse"))
+            address_match = bool(cp_text and cp_addr and cp_text == cp_addr)
+            if address_match:
+                pts += 15  # CP concordant
+
+            naf_coherent = _naf_is_construction(mapped.get("naf"))
+            if naf_coherent:
+                pts += 10  # NAF 41/42/43
+
+            identification_pct = max(0, min(100, pts))
+
             out = {
                 "file": f.filename,
                 "raisonSociale": mapped.get("raisonSociale"),
@@ -253,7 +300,13 @@ async def verify(files: List[UploadFile] = File(...)):
                 "exercice": fin.get("exercice"),
                 "note": g.get("note"),
                 "nbAvis": g.get("nbAvis"),
-                "scores": {"identification_pct": 100 if (siret_final or (ids.get("siren") or mapped.get("siren"))) else 0},
+                "scores": {
+                    "identification_pct": identification_pct,
+                    "siret_match": siret_match,
+                    "name_similarity_pct": name_similarity_pct,
+                    "address_match": address_match,
+                    "naf_coherent": naf_coherent
+                },
                 "drapeaux_rouges": [] if (siret_final or (ids.get("siren") or mapped.get("siren"))) else ["SIRET/SIREN introuvable"],
             }
             results.append(out)
